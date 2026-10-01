@@ -1,0 +1,215 @@
+site_name: HealthChain
+site_url: https://healthchainai.github.io/HealthChain/
+site_description: An open-source Python SDK for healthcare AI — typed, validated FHIR tools your models and agents can trust, plus real-time EHR connectivity and production deployment.
+site_author: Jennifer Jiang-Kells
+
+# Repository
+repo_name: healthchainai/healthchain
+repo_url: https://github.com/healthchainai/healthchain
+
+# Fail loudly on broken internal links and anchors
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: installation.md
+      - Quickstart: quickstart.md
+      - CLI: cli.md
+      - Licence: distribution.md
+  - Tutorials:
+      - tutorials/index.md
+      - ClinicalFlow Tutorial:
+          - Introduction: tutorials/clinicalflow/index.md
+          - Setup: tutorials/clinicalflow/setup.md
+          - FHIR Basics: tutorials/clinicalflow/fhir-basics.md
+          - Build Pipeline: tutorials/clinicalflow/pipeline.md
+          - Create Gateway: tutorials/clinicalflow/gateway.md
+          - Test with Sandbox: tutorials/clinicalflow/testing.md
+          - Next Steps: tutorials/clinicalflow/next-steps.md
+  - Cookbook:
+      - cookbook/index.md
+      - FHIR-Grounded Patient Q&A: cookbook/fhir_qa.md
+      - Multi-Source Data Integration: cookbook/multi_ehr_aggregation.md
+      - Research Extract to FHIR API: cookbook/research_extract_fhir_api.md
+      - Automated Clinical Coding: cookbook/clinical_coding.md
+      - Discharge Summarizer: cookbook/discharge_summarizer.md
+      - ML Model Deployment: cookbook/ml_model_deployment.md
+  - Docs:
+      - Welcome: reference/index.md
+      - Core Concepts: reference/concepts.md
+      - Gateway:
+        - Overview: reference/gateway/gateway.md
+        - HealthChainAPI: reference/gateway/api.md
+        - FHIR Gateway: reference/gateway/fhir_gateway.md
+        - Events: reference/gateway/events.md
+        - Protocols:
+          - CDS Hooks: reference/gateway/cdshooks.md
+          - SOAP/CDA: reference/gateway/soap_cda.md
+      - FHIR & Validation:
+        - FHIR Helpers: reference/utilities/fhir_helpers.md
+        - Terminology: reference/utilities/terminology.md
+      - Agent Tools: reference/utilities/tools.md
+      - Sandbox:
+        - Sandbox Client: reference/utilities/sandbox.md
+        - Test Data Generators: reference/utilities/data_generator.md
+        - Connecting to FHIR Sandboxes: cookbook/setup_fhir_sandboxes.md
+      - Pipeline & I/O:
+        - Pipeline: reference/pipeline/pipeline.md
+        - Components: reference/pipeline/components/components.md
+        - Containers:
+          - Overview: reference/io/containers/containers.md
+          - Document: reference/io/containers/document.md
+        - Adapters:
+          - Overview: reference/io/adapters/adapters.md
+          - CDA Adapter: reference/io/adapters/cdaadapter.md
+          - CDS FHIR Adapter: reference/io/adapters/cdsfhiradapter.md
+      - Configuration: reference/config.md
+      - Security & Compliance: security.md
+      - Interoperability (CDA):
+        - Overview: reference/interop/interop.md
+        - Engine: reference/interop/engine.md
+        - Configuration: reference/interop/configuration.md
+        - Templates: reference/interop/templates.md
+        - Mappings: reference/interop/mappings.md
+        - Parsers: reference/interop/parsers.md
+        - Generators: reference/interop/generators.md
+        - Working with xmltodict: reference/interop/xmltodict.md
+  - API Reference:
+      - api/index.md
+      - api/pipeline.md
+      - api/component.md
+      - api/containers.md
+      - api/adapters.md
+      - api/cds_hooks.md
+      - api/sandbox.md
+      - api/interop.md
+      - api/fhir_helpers.md
+      - api/terminology.md
+      - api/tools.md
+  - Community:
+      - community/index.md
+
+copyright: dotimplement ai
+theme:
+  name: material
+  custom_dir: docs/overrides/
+  favicon: assets/brand/favicons/favicon.svg
+  logo: assets/brand/marks/plug.svg
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - content.code.copy
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.footer
+    - toc.integrate
+    - navigation.instant
+    - header.autohide
+    - announce.dismiss
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: white
+      # accent set to brand salmon via --md-accent-fg-color in stylesheets/extra.css
+      toggle:
+        icon: material/white-balance-sunny
+        name: Switch to dark mode
+    - scheme: slate
+      primary: black
+      # accent set to brand salmon via --md-accent-fg-color in stylesheets/extra.css
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+# font:
+#     text: Roboto
+
+
+# Additional configuration
+extra:
+  analytics:
+    provider: google
+    property: !ENV GOOGLE_ANALYTICS_TAG
+
+
+# Extensions
+markdown_extensions:
+  - admonition
+  - tables
+  - def_list
+  - attr_list
+  - md_in_html:
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra_css:
+  - stylesheets/extra.css
+  - stylesheets/welcome.css
+
+extra_javascript:
+  - javascripts/cookbook-filter.js
+
+plugins:
+  - blog
+  - llmstxt:
+      markdown_description: >-
+        HealthChain is an open-source Python SDK for building healthcare AI
+        applications — type-safe FHIR resources with validation, agent tools
+        served over MCP and LangChain, real-time EHR connectivity (FHIR APIs,
+        CDS Hooks, SOAP/CDA), and production deployment tooling.
+      full_output: llms-full.txt
+      sections:
+        Getting started:
+          - installation.md: Install HealthChain and its optional extras
+          - quickstart.md: Build your first gateway and agent tools, then test them with the sandbox
+          - cli.md: The healthchain CLI (new, serve, mcp)
+        Cookbook:
+          - cookbook/index.md
+          - cookbook/setup_fhir_sandboxes.md
+          - cookbook/fhir_qa.md
+          - cookbook/multi_ehr_aggregation.md
+          - cookbook/research_extract_fhir_api.md
+          - cookbook/clinical_coding.md
+          - cookbook/discharge_summarizer.md
+          - cookbook/ml_model_deployment.md
+        Reference:
+          - reference/*.md
+          - security.md: Security and compliance configuration
+        API:
+          - api/*.md
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            show_submodules: true
+            heading_level: 2
+            docstring_section_style: spacy
+            show_source: false
+  - search
+  # - section-index
+  # Auto-generated Open Graph / Twitter preview cards (one per page) for when
+  # docs links are shared. Needs the imaging libs — see requirements-doc.txt and
+  # the apt step in the doc workflows.
+  - social:
+      cards_layout_options:
+        background_color: "#211c26"
+        color: "#f4f4f6"
+        # White-prong variant so the plug stays legible on the dark card
+        logo: docs/assets/brand/marks/plug-reverse.svg

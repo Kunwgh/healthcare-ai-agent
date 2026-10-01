@@ -1,0 +1,8 @@
+# CDS Hooks
+
+::: healthchain.models.hooks.encounterdischarge
+::: healthchain.models.hooks.orderselect
+::: healthchain.models.hooks.ordersign
+::: healthchain.models.hooks.patientview
+::: healthchain.models.responses.cdsdiscovery
+::: healthchain.models.responses.cdsfeedback

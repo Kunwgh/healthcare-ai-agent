@@ -1,0 +1,859 @@
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+# ANSI color helpers — consistent with startup banner palette
+_RST = "\033[0m"
+_BOLD = "\033[1m"
+_DIM = "\033[2m"
+_GREEN = "\033[38;2;0;255;135m"
+_CYAN = "\033[38;2;0;215;255m"
+_INDIGO = "\033[38;2;99;102;241m"
+_PINK = "\033[38;2;255;121;198m"
+_AMBER = "\033[38;2;255;180;50m"
+_RED = "\033[38;2;255;85;85m"
+
+_DOCKERFILE = """\
+# HealthChain application Dockerfile
+#
+# Usage:
+#   Build:  docker build -t my-healthcare-app .
+#   Run:    docker run -p 8000:8000 --env-file .env -v ./logs:/app/logs my-healthcare-app
+#
+# Required environment variables (set in .env or pass via -e):
+#   APP_MODULE   Python module path to your app, e.g. "myapp:app" (default: "app:app")
+#
+# FHIR source credentials (if connecting to Epic/Cerner):
+#   FHIR_BASE_URL, CLIENT_ID, CLIENT_SECRET or CLIENT_SECRET_PATH
+#
+# See docs: https://healthchainai.github.io/HealthChain/reference/gateway/gateway/
+
+FROM python:3.11-slim
+
+# Keeps Python from buffering stdout/stderr
+ENV PYTHONUNBUFFERED=1 \\
+    PYTHONDONTWRITEBYTECODE=1 \\
+    APP_MODULE=app:app \\
+    PORT=8000
+
+WORKDIR /app
+
+# Install system dependencies needed by lxml and spaCy
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    gcc \\
+    g++ \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Install healthchain from PyPI
+RUN pip install --no-cache-dir healthchain
+
+# Install any additional dependencies your application needs
+# (copy requirements first to leverage Docker layer caching)
+COPY requirements.txt* ./
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+# Copy application code
+COPY . .
+
+# Run as non-root user
+RUN useradd -m appuser && chown -R appuser /app
+USER appuser
+
+EXPOSE $PORT
+
+# Mount this path to persist audit logs outside the container
+VOLUME ["/app/logs"]
+
+CMD uvicorn $APP_MODULE --host 0.0.0.0 --port $PORT
+"""
+
+_DOCKERIGNORE = """\
+.git
+.idea
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+tests/
+docs/
+notebooks/
+output/
+*.md
+!README.md
+"""
+
+_ENV_EXAMPLE_CDS_HOOKS = """\
+# CDS Hooks service — no credentials required to run locally.
+# Add FHIR source credentials if your hook fetches patient data.
+
+# FHIR_BASE_URL=
+# CLIENT_ID=
+# CLIENT_SECRET=
+
+# For JWT assertion flow (e.g. Epic SMART on FHIR)
+# CLIENT_SECRET_PATH=/path/to/private_key.pem
+
+# API key authentication (set security.auth: api-key in healthchain.yaml to enforce)
+# HEALTHCHAIN_API_KEY=your-key-here
+"""
+
+_ENV_EXAMPLE_FHIR_GATEWAY = """\
+# FHIR source credentials
+# The scaffold configures one source. Add further source blocks and matching
+# `sources:` entries in healthchain.yaml when the service needs them.
+
+# Epic
+EPIC_BASE_URL=https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4
+EPIC_CLIENT_ID=
+EPIC_CLIENT_SECRET=
+EPIC_TOKEN_URL=
+# EPIC_CLIENT_SECRET_PATH=/path/to/epic_private_key.pem
+
+# API key authentication (set security.auth: api-key in healthchain.yaml to enforce)
+# HEALTHCHAIN_API_KEY=your-key-here
+
+# See docs: https://healthchainai.github.io/HealthChain/reference/gateway/fhir_gateway/
+"""
+
+_ENV_EXAMPLE_DEFAULT = """\
+# FHIR source credentials
+FHIR_BASE_URL=
+CLIENT_ID=
+CLIENT_SECRET=
+
+# For JWT assertion flow (e.g. Epic SMART on FHIR)
+# CLIENT_SECRET_PATH=/path/to/private_key.pem
+
+# API key authentication (set security.auth: api-key in healthchain.yaml to enforce)
+# HEALTHCHAIN_API_KEY=your-key-here
+"""
+
+_REQUIREMENTS = "healthchain\n"
+
+_APP_PY_DEFAULT = """\
+# Your HealthChain application goes here.
+# See https://healthchainai.github.io/HealthChain/ for examples.
+"""
+
+_APP_PY_CDS_HOOKS = """\
+from healthchain.gateway import HealthChainAPI
+from healthchain.gateway.cds import CDSHooksService
+from healthchain.models.requests.cdsrequest import CDSRequest
+from healthchain.models.responses.cdsresponse import CDSResponse
+
+app = HealthChainAPI(
+    title="My CDS Service",
+    description="A CDS Hooks service built with HealthChain",
+)
+
+cds = CDSHooksService()
+
+
+@cds.hook("patient-view", id="my-service", title="My CDS Service")
+def patient_view(request: CDSRequest) -> CDSResponse:
+    # Add your clinical decision support logic here.
+    # request.context contains patient/encounter context from the EHR.
+    # request.prefetch contains pre-fetched FHIR resources.
+    return CDSResponse(
+        cards=[
+            {
+                "summary": "HealthChain CDS",
+                "detail": "Add your clinical logic here.",
+                "indicator": "info",
+                "source": {"label": "My CDS Service"},
+            }
+        ]
+    )
+
+
+app.register_service(cds)
+"""
+
+_APP_PY_FHIR_GATEWAY = """\
+from typing import List
+
+from healthchain.fhir.r4b import Bundle, Condition
+from healthchain.gateway import FHIRGateway, HealthChainAPI
+from healthchain.config.appconfig import AppConfig
+from healthchain.fhir import merge_bundles
+from healthchain.io.containers import Document
+from healthchain.pipeline import Pipeline
+
+# Loads .env then healthchain.yaml — sources are declared there, credentials stay in .env
+config = AppConfig.load()
+gateway = FHIRGateway.from_config(config)
+
+# To enable LLM processing: add an llm: section to healthchain.yaml,
+# pip install langchain, then uncomment:
+# from langchain.chat_models import init_chat_model
+# llm = init_chat_model(f"{config.llm.provider}:{config.llm.model}") if config.llm else None
+
+pipeline = Pipeline()
+
+
+@pipeline.add_node
+def process(doc: Document) -> Document:
+    # Add your NLP/ML/LLM processing steps here
+    # if llm:
+    #     response = llm.invoke(doc.text)
+    return doc
+
+
+@gateway.aggregate(Condition)
+def get_patient_conditions(patient_id: str, sources: List[str]) -> Bundle:
+    \"\"\"Aggregate conditions for a patient from all configured FHIR sources.\"\"\"
+    bundles = []
+    for source in sources:
+        try:
+            bundle = gateway.search(
+                Condition,
+                {"patient": patient_id},
+                source,
+                add_provenance=True,
+            )
+            bundles.append(bundle)
+        except Exception as e:
+            print(f"Error from {source}: {e}")
+
+    merged = merge_bundles(bundles, deduplicate=True)
+    doc = pipeline(Document(data=merged))
+    return doc.fhir.bundle
+
+
+app = HealthChainAPI(
+    title="My FHIR Gateway",
+    description="A multi-EHR data aggregation service built with HealthChain",
+)
+app.register_gateway(gateway)
+"""
+
+
+def _make_healthchain_yaml(name: str, service_type: str) -> str:
+    if service_type == "fhir-gateway":
+        sources_block = """\
+# FHIR data sources — credentials stay in .env, source names declared here
+# FHIRGateway.from_config(config) in app.py wires these up automatically
+sources:
+  epic:
+    env_prefix: EPIC    # reads EPIC_CLIENT_ID, EPIC_BASE_URL, EPIC_TOKEN_URL from .env"""
+    else:
+        sources_block = """\
+# FHIR data sources — declare sources here, credentials stay in .env
+# sources:
+#   epic:
+#     env_prefix: EPIC    # reads EPIC_CLIENT_ID, EPIC_BASE_URL, EPIC_TOKEN_URL from .env"""
+
+    return f"""\
+# HealthChain application configuration
+# https://healthchainai.github.io/HealthChain/reference/config
+
+name: {name}
+version: "1.0.0"
+
+# Service settings — read by `healthchain serve`
+service:
+  type: {service_type}
+  port: 8000
+
+# Security controls
+security:
+  auth: none              # none | api-key
+  tls:
+    enabled: false
+    cert_path: ./certs/server.crt
+    key_path: ./certs/server.key
+  allowed_origins:
+    - "*"
+
+# Compliance settings
+compliance:
+  audit_log: ./logs/audit.jsonl
+
+# Governance context — declarative metadata only; no compliance enforcement
+# governance:
+#   standards:             # open identifiers, e.g. dcb0129, dcb0160, hipaa
+#     - dcb0129
+#     - dcb0160
+#   clinical_safety_officer: ""
+#   data_access_agreement: ""  # path or URL to the signed agreement
+#   dpia_required: false
+#   notes: ""
+
+# Site / deployment metadata
+site:
+  name: ""
+  environment: development  # development | staging | production
+
+{sources_block}
+
+# LLM provider — uncomment and wire up with LangChain's init_chat_model in app.py to enable
+# llm:
+#   provider: anthropic     # anthropic | openai | google | huggingface
+#   model: claude-opus-4-8
+#   max_tokens: 512
+"""
+
+
+def new_project(name: str, template: str) -> None:
+    """Scaffold a new HealthChain project.
+
+    `name` is a directory to create, or "." to scaffold into the current
+    directory — the common case when adding a service to an existing repo.
+    """
+    in_place = name in (".", "./")
+    project_dir = Path(".") if in_place else Path(name)
+    project_name = Path.cwd().name if in_place else name
+
+    if not in_place:
+        if project_dir.exists():
+            print(f"Error: directory '{name}' already exists.")
+            return
+        project_dir.mkdir()
+
+    _app_py = {
+        "cds-hooks": _APP_PY_CDS_HOOKS,
+        "fhir-gateway": _APP_PY_FHIR_GATEWAY,
+        "default": _APP_PY_DEFAULT,
+    }
+    _env_example = {
+        "cds-hooks": _ENV_EXAMPLE_CDS_HOOKS,
+        "fhir-gateway": _ENV_EXAMPLE_FHIR_GATEWAY,
+        "default": _ENV_EXAMPLE_DEFAULT,
+    }
+    service_type = template if template != "default" else "fhir-gateway"
+
+    files = {
+        "app.py": _app_py[template],
+        "healthchain.yaml": _make_healthchain_yaml(project_name, service_type),
+        ".env.example": _env_example[template],
+        "requirements.txt": _REQUIREMENTS,
+        "Dockerfile": _DOCKERFILE,
+        ".dockerignore": _DOCKERIGNORE,
+    }
+
+    # Scaffolding in place lands among files someone else wrote — refuse per
+    # file rather than overwriting any of them.
+    clashes = [filename for filename in files if (project_dir / filename).exists()]
+    if clashes:
+        verb = "already exists" if len(clashes) == 1 else "already exist"
+        print(f"Error: {', '.join(clashes)} {verb} here. Nothing was written.")
+        print("Move or remove them, or scaffold into a new directory instead.")
+        return
+
+    for filename, content in files.items():
+        (project_dir / filename).write_text(content)
+
+    prefix = "" if in_place else f"{name}/"
+    if in_place:
+        print(f"\n{_BOLD}{_GREEN}✚ Created project in '{project_name}/'{_RST}")
+    else:
+        print(f"\n{_BOLD}{_GREEN}✚ Created project '{name}/'{_RST}")
+    for filename in files:
+        if filename != ".dockerignore":
+            print(f"  {_CYAN}{prefix}{filename}{_RST}")
+    print(f"\n{_BOLD}Next steps:{_RST}")
+    if not in_place:
+        print(f"  {_BOLD}cd {name}{_RST}")
+    if template == "cds-hooks":
+        print(
+            f"  {_BOLD}healthchain serve{_RST}          {_DIM}# starts the CDS Hooks service{_RST}"
+        )
+        print(f"  {_BOLD}open http://localhost:8000/docs{_RST}")
+    elif template == "fhir-gateway":
+        print(
+            f"  {_BOLD}cp .env.example .env{_RST}       {_DIM}# fill in your FHIR source credentials{_RST}"
+        )
+        print(
+            f"  {_BOLD}healthchain serve{_RST}          {_DIM}# starts the FHIR gateway{_RST}"
+        )
+        print(f"  {_BOLD}open http://localhost:8000/docs{_RST}")
+    else:
+        print(f"  {_DIM}# Pick a template to get started:{_RST}")
+        print(f"  {_BOLD}healthchain new my-app --template cds-hooks{_RST}")
+        print(f"  {_BOLD}healthchain new my-app --template fhir-gateway{_RST}")
+    print(f"\n{_INDIGO}Configure your app in healthchain.yaml{_RST}")
+    print(f"{_DIM}See https://healthchainai.github.io/HealthChain/ for examples.{_RST}")
+
+
+def eject_templates(target_dir: str):
+    """Eject built-in interop templates for customization."""
+    try:
+        from healthchain.interop import init_config_templates
+
+        target_path = init_config_templates(target_dir)
+        print(f"\n{_GREEN}✓ Templates ejected to: {_BOLD}{target_path}{_RST}")
+        print(f"\n{_BOLD}Next steps:{_RST}")
+        print("  1. Customize the templates in the created directory")
+        print("  2. Use them in your code:")
+        print(f"     {_DIM}from healthchain.interop import create_interop{_RST}")
+        print(f"     {_DIM}engine = create_interop(config_dir='{target_dir}'){_RST}")
+        print(
+            f"\n{_DIM}See https://healthchainai.github.io/HealthChain/reference/interop/ for details.{_RST}"
+        )
+
+    except FileExistsError as e:
+        print(f"\n{_RED}Error: {str(e)}{_RST}")
+        print(
+            f"{_DIM}Choose a different directory name or remove the existing one.{_RST}"
+        )
+    except Exception as e:
+        print(f"\n{_RED}Error ejecting templates: {str(e)}{_RST}")
+        print(f"{_DIM}Make sure HealthChain is properly installed.{_RST}")
+
+
+def serve(app_module: str, host: str, port: int | None):
+    """Start a HealthChain app with uvicorn."""
+    from healthchain.config.appconfig import AppConfig
+
+    config = AppConfig.load()
+
+    # Resolve port: CLI arg > config > default
+    resolved_port = (
+        port if port is not None else (config.service.port if config else 8000)
+    )
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        app_module,
+        "--host",
+        host,
+        "--port",
+        str(resolved_port),
+    ]
+
+    if config and config.security.tls.enabled:
+        cmd += [
+            "--ssl-certfile",
+            config.security.tls.cert_path,
+            "--ssl-keyfile",
+            config.security.tls.key_path,
+        ]
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Server error: {e}")
+    except KeyboardInterrupt:
+        pass
+
+
+def serve_mcp(bundle: str | None):
+    """Serve the FHIR toolkit as an MCP server over stdio."""
+    from healthchain.tools import FHIRToolkit
+
+    toolkit = FHIRToolkit(bundle=bundle)
+    toolkit.as_mcp().run(transport="stdio")
+
+
+def sandbox_run(
+    url: str,
+    workflow: str,
+    size: int,
+    from_path: str | None,
+    output: str | None,
+    no_save: bool,
+):
+    """Fire test requests at a running HealthChain service."""
+    from healthchain.sandbox import SandboxClient
+
+    resolved_output = output or "./output"
+    resolved_from_path = from_path or None
+
+    print(f"\n{_BOLD}{_CYAN}◆ Sandbox{_RST}  {_DIM}{url}{_RST}")
+    print(f"  {_CYAN}workflow  {_RST}{workflow}")
+
+    try:
+        client = SandboxClient(url=url, workflow=workflow)
+    except ValueError as e:
+        print(f"\n{_RED}Error:{_RST} {e}")
+        return
+
+    if resolved_from_path:
+        print(f"\n{_DIM}Loading from {resolved_from_path}...{_RST}")
+        try:
+            client.load_from_path(resolved_from_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"{_RED}Error loading data:{_RST} {e}")
+            return
+    else:
+        print(f"\n{_DIM}Generating {size} synthetic request(s)...{_RST}")
+        try:
+            client.load_synthetic(n=size)
+        except ValueError as e:
+            print(f"{_RED}Error generating synthetic data:{_RST} {e}")
+            return
+
+    print(f"{_DIM}Sending {len(client.requests)} request(s) to service...{_RST}\n")
+
+    try:
+        responses = client.send_requests()
+    except RuntimeError as e:
+        print(f"{_RED}Error:{_RST} {e}")
+        return
+
+    # Print response summary
+    success = sum(1 for r in responses if r)
+    result_col = _GREEN if success == len(responses) else _AMBER
+    print(
+        f"{_BOLD}Results:{_RST} {result_col}{success}/{len(responses)} successful{_RST}\n"
+    )
+
+    indicator_colours = {
+        "INFO": _CYAN,
+        "WARNING": _AMBER,
+        "CRITICAL": _RED,
+        "SUCCESS": _GREEN,
+    }
+    for i, response in enumerate(responses):
+        cards = response.get("cards", [])
+        if not cards:
+            print(f"  {_DIM}[{i + 1}] no cards returned{_RST}")
+            continue
+        print(f"  {_BOLD}[{i + 1}]{_RST} {len(cards)} card(s)")
+        for card in cards:
+            indicator = card.get("indicator", "info").upper()
+            summary = card.get("summary", "")
+            ind_col = indicator_colours.get(indicator, _DIM)
+            print(f"      {ind_col}{indicator}{_RST}  {summary}")
+
+    if not no_save:
+        client.save_results(resolved_output)
+        print(f"\n{_GREEN}✓{_RST} Saved to {_BOLD}{resolved_output}/{_RST}")
+
+
+def seed_medplum(path: str):
+    """Seed Medplum with FHIR data from a JSON file or directory."""
+    from pathlib import Path
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+    try:
+        from healthchain.gateway.clients.fhir.base import FHIRAuthConfig
+
+        config = FHIRAuthConfig.from_env("MEDPLUM")
+    except Exception as e:
+        print(f"\n{_RED}Error:{_RST} Could not load Medplum credentials: {e}")
+        print(
+            f"{_DIM}Set MEDPLUM_CLIENT_ID, MEDPLUM_CLIENT_SECRET, "
+            f"MEDPLUM_BASE_URL, MEDPLUM_TOKEN_URL in .env{_RST}"
+        )
+        return
+
+    target = Path(path)
+    if not target.exists():
+        print(f"\n{_RED}Error:{_RST} Path not found: {path}")
+        return
+
+    from healthchain.sandbox.seeders import seed_from_directory, seed_from_file
+
+    print(f"\n{_BOLD}{_CYAN}◆ Seeding Medplum{_RST}  {_DIM}{target}{_RST}\n")
+
+    try:
+        if target.is_dir():
+            results = seed_from_directory(config, target)
+            if not results:
+                print(f"  {_AMBER}No JSON files found in {target}{_RST}")
+                return
+            for name, ids in results.items():
+                for patient_id in ids:
+                    print(
+                        f"  {_GREEN}✓{_RST} {_CYAN}{name}{_RST}  →  {_BOLD}PATIENT_ID={patient_id}{_RST}"
+                    )
+        else:
+            ids = seed_from_file(config, target)
+            if not ids:
+                print(f"  {_GREEN}✓{_RST} Uploaded (no Patient resources found)")
+            for patient_id in ids:
+                print(f"  {_GREEN}✓{_RST} {_BOLD}DEMO_PATIENT_ID={patient_id}{_RST}")
+    except Exception as e:
+        print(f"\n{_RED}Error:{_RST} {e}")
+
+
+def status():
+    """Show current project status from healthchain.yaml."""
+    from healthchain.config.appconfig import AppConfig
+
+    config = AppConfig.load()
+
+    if config is None:
+        print(f"\n{_AMBER}No healthchain.yaml found in current directory.{_RST}")
+        print(f"Run {_BOLD}healthchain new <name>{_RST} to scaffold a project.")
+        return
+
+    def _key(k: str) -> str:
+        return f"  {_CYAN}{k}{_RST}"
+
+    def _val_on(v: str) -> str:
+        return f"{_GREEN}{v}{_RST}"
+
+    def _val_off(v: str) -> str:
+        return f"{_RED}{v}{_RST}"
+
+    def _val_env(e: str) -> str:
+        c = {
+            "production": _GREEN,
+            "staging": _CYAN,
+            "development": _AMBER,
+        }.get(e, _RST)
+        return f"{c}{e}{_RST}"
+
+    def _section(s: str) -> str:
+        return f"\n{_BOLD}{_INDIGO}{s}{_RST}"
+
+    print(
+        f"\n{_BOLD}{_PINK}✚ HealthChain{_RST}  "
+        f"{_BOLD}{config.name}{_RST}  {_DIM}v{config.version}{_RST}"
+    )
+    print(f"{_INDIGO}{'─' * 40}{_RST}")
+
+    print(_section("Service"))
+    print(f"{_key('type        ')}{config.service.type}")
+    print(f"{_key('port        ')}{_BOLD}{config.service.port}{_RST}")
+
+    print(_section("Site"))
+    print(f"{_key('environment ')}{_val_env(config.site.environment)}")
+    if config.site.name:
+        print(f"{_key('name        ')}{config.site.name}")
+
+    print(_section("Security"))
+    auth_col = _GREEN if config.security.auth != "none" else _AMBER
+    print(f"{_key('auth        ')}{auth_col}{config.security.auth}{_RST}")
+    tls_val = (
+        _val_on("enabled") if config.security.tls.enabled else f"{_DIM}disabled{_RST}"
+    )
+    print(f"{_key('TLS         ')}{tls_val}")
+    origins = ", ".join(config.security.allowed_origins)
+    print(f"{_key('origins     ')}{_DIM}{origins}{_RST}")
+
+    print(_section("Compliance"))
+    if config.compliance.audit_log:
+        print(f"{_key('audit log   ')}{_BOLD}{config.compliance.audit_log}{_RST}")
+    else:
+        print(f"{_key('audit log   ')}{_DIM}disabled{_RST}")
+
+    governance = config.governance
+    if (
+        governance.standards
+        or governance.clinical_safety_officer
+        or governance.data_access_agreement
+        or governance.dpia_required
+        or governance.notes
+    ):
+        print(_section("Governance"))
+        if governance.standards:
+            print(f"{_key('standards   ')}{', '.join(governance.standards)}")
+        if governance.clinical_safety_officer:
+            print(
+                f"{_key('CSO         ')}"
+                f"{_BOLD}{governance.clinical_safety_officer}{_RST}"
+            )
+        daa_val = (
+            _val_on("configured")
+            if governance.data_access_agreement
+            else f"{_DIM}not configured{_RST}"
+        )
+        print(f"{_key('data access ')}{daa_val}")
+        dpia_val = (
+            f"{_AMBER}required{_RST}"
+            if governance.dpia_required
+            else f"{_DIM}not required{_RST}"
+        )
+        print(f"{_key('DPIA        ')}{dpia_val}")
+        if governance.notes:
+            print(f"{_key('notes       ')}{_val_on('configured')}")
+
+    if config.sources:
+        print(_section("Sources"))
+        for source_name, source in config.sources.items():
+            print(
+                f"{_key(f'{source_name:<12}')}{_DIM}env_prefix={source.env_prefix}{_RST}"
+            )
+
+    if config.llm:
+        print(_section("LLM"))
+        print(f"{_key('provider    ')}{config.llm.provider}")
+        print(f"{_key('model       ')}{_BOLD}{config.llm.model}{_RST}")
+
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            f"{_BOLD}{_CYAN}✚ HealthChain{_RST}  {_DIM}Open-Source Healthcare AI{_RST}\n"
+            f"{_INDIGO}{'─' * 40}{_RST}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subparser for the 'new' command
+    new_parser = subparsers.add_parser("new", help="Scaffold a new HealthChain project")
+    new_parser.add_argument(
+        "name",
+        type=str,
+        help="Project name (creates a directory), or '.' to scaffold into the current directory",
+    )
+    new_parser.add_argument(
+        "--type",
+        "-t",
+        type=str,
+        default="default",
+        choices=["cds-hooks", "fhir-gateway", "default"],
+        help="Project type (default: empty stub)",
+        dest="template",
+    )
+
+    # Subparser for the 'serve' command
+    serve_parser = subparsers.add_parser(
+        "serve", help="Start a HealthChain app with uvicorn"
+    )
+    serve_parser.add_argument(
+        "app_module",
+        type=str,
+        nargs="?",
+        default="app:app",
+        help="Module path to your app (default: app:app)",
+    )
+    serve_parser.add_argument(
+        "--host", type=str, default="0.0.0.0", help="Host (default: 0.0.0.0)"
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port (default: from healthchain.yaml or 8000)",
+    )
+
+    # Subparser for the 'mcp' command
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="Serve FHIR agent tools as an MCP server over stdio "
+        "(requires healthchain[mcp])",
+    )
+    mcp_parser.add_argument(
+        "--bundle",
+        type=str,
+        default=None,
+        help="Optional FHIR Bundle (file path) to preload for the read tools",
+    )
+
+    # Subparser for the 'sandbox' command
+    sandbox_parser = subparsers.add_parser(
+        "sandbox", help="Send test requests to a running HealthChain service"
+    )
+    sandbox_subparsers = sandbox_parser.add_subparsers(
+        dest="sandbox_command", required=True
+    )
+    sandbox_run_parser = sandbox_subparsers.add_parser(
+        "run", help="Fire test requests at a service"
+    )
+    sandbox_run_parser.add_argument(
+        "--url",
+        type=str,
+        required=True,
+        help="Full service URL (e.g. http://localhost:8000/cds/cds-services/my-service)",
+    )
+    sandbox_run_parser.add_argument(
+        "--workflow",
+        type=str,
+        default="patient-view",
+        choices=["patient-view", "order-select", "order-sign", "encounter-discharge"],
+        help="CDS workflow to simulate (default: patient-view)",
+    )
+    sandbox_run_parser.add_argument(
+        "--size",
+        type=int,
+        default=3,
+        help="Number of synthetic requests to generate (default: 3)",
+    )
+    sandbox_run_parser.add_argument(
+        "--from-path",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Load requests from a file or directory instead of generating synthetic data",
+    )
+    sandbox_run_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Directory to save results (default: from healthchain.yaml or ./output)",
+    )
+    sandbox_run_parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Don't save results to disk",
+    )
+
+    # Subparser for the 'seed' command
+    seed_parser = subparsers.add_parser(
+        "seed", help="Seed a FHIR test server with demo data"
+    )
+    seed_subparsers = seed_parser.add_subparsers(dest="seed_command", required=True)
+    seed_medplum_parser = seed_subparsers.add_parser(
+        "medplum", help="Upload FHIR data to Medplum"
+    )
+    seed_medplum_parser.add_argument(
+        "path",
+        type=str,
+        help="Path to a FHIR JSON file or directory of JSON files",
+    )
+
+    # Subparser for the 'status' command
+    subparsers.add_parser("status", help="Show project status from healthchain.yaml")
+
+    # Subparser for the 'eject-templates' command
+    eject_parser = subparsers.add_parser(
+        "eject-templates",
+        help="Eject built-in interop templates for customization",
+    )
+    eject_parser.add_argument(
+        "target_dir",
+        type=str,
+        nargs="?",
+        default="./healthchain_configs",
+        help="Directory to eject templates into (default: ./healthchain_configs)",
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "new":
+        new_project(args.name, args.template)
+    elif args.command == "serve":
+        serve(args.app_module, args.host, args.port)
+    elif args.command == "mcp":
+        serve_mcp(args.bundle)
+    elif args.command == "sandbox":
+        if args.sandbox_command == "run":
+            sandbox_run(
+                url=args.url,
+                workflow=args.workflow,
+                size=args.size,
+                from_path=args.from_path,
+                output=args.output,
+                no_save=args.no_save,
+            )
+    elif args.command == "seed":
+        if args.seed_command == "medplum":
+            seed_medplum(args.path)
+    elif args.command == "status":
+        status()
+    elif args.command == "eject-templates":
+        eject_templates(args.target_dir)
+
+
+if __name__ == "__main__":
+    main()
